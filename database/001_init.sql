@@ -1,0 +1,14 @@
+create extension if not exists pgcrypto;
+create table plans(id serial primary key,name text unique not null,max_accounts int not null,monthly_posts int not null,max_mb int not null,horizon_days int not null,publish_ok boolean not null default true);
+create table users(id uuid primary key default gen_random_uuid(),email text unique not null,name text,pass_hash text not null,role text not null default 'CUSTOMER' check(role in('ADMIN','CUSTOMER')),active boolean not null default true,plan_id int references plans(id),pay_status text not null default 'UNPAID' check(pay_status in('UNPAID','PAYMENT_PENDING','PAID','OVERDUE','REFUNDED','CANCELLED')),pay_expires timestamptz,publish_enabled boolean not null default true,last_login timestamptz,created_at timestamptz not null default now());
+create table sessions(token_hash text primary key,user_id uuid not null references users(id) on delete cascade,expires_at timestamptz not null);
+create table ig_accounts(id uuid primary key default gen_random_uuid(),user_id uuid not null references users(id),ig_user_id text not null,username text,picture text,token_enc text,token_expires timestamptz,status text not null default 'CONNECTED' check(status in('CONNECTED','DISCONNECTED','REAUTH_REQUIRED','CONNECTION_ERROR')),enabled boolean not null default true,last_error text,created_at timestamptz not null default now(),unique(user_id,ig_user_id));
+create table videos(id uuid primary key default gen_random_uuid(),user_id uuid not null references users(id),key text unique not null,filename text,size bigint,status text not null default 'UPLOADING',created_at timestamptz not null default now());
+create table posts(id uuid primary key default gen_random_uuid(),user_id uuid not null references users(id),video_id uuid not null references videos(id),account_id uuid not null references ig_accounts(id),caption text,run_at timestamptz not null,status text not null default 'SCHEDULED' check(status in('SCHEDULED','PROCESSING','PUBLISHED','FAILED','CANCELLED','BLOCKED')),attempts int not null default 0,next_try timestamptz,container text,media_id text,error text,created_at timestamptz not null default now(),updated_at timestamptz not null default now());
+create unique index posts_dedupe on posts(video_id,account_id,run_at) where status<>'CANCELLED';
+create index posts_due on posts(run_at) where status='SCHEDULED';
+create index posts_user on posts(user_id,run_at);
+create table settings(key text primary key,value text not null);
+create table audit(id bigserial primary key,admin_id uuid,action text not null,detail jsonb,at timestamptz not null default now());
+insert into plans(name,max_accounts,monthly_posts,max_mb,horizon_days,publish_ok) values('Free',1,10,50,7,false),('Paid',50,5000,100,90,true);
+insert into settings values('paused','false'),('retention_days','1');
