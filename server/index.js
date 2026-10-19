@@ -147,15 +147,18 @@ app.get('/api/dashboard', auth, h(async (req, res) => {
 }));
 // ---- Instagram accounts
 app.get('/api/accounts', auth, h(async (req, res) => res.json(await q('select id,ig_user_id,username,picture,status,enabled,token_expires,last_error,(select count(*) from posts p where p.account_id=a.id and p.status=\'SCHEDULED\')::int scheduled from ig_accounts a where user_id=$1 order by created_at', [req.user.id]))));
-app.get('/api/ig/connect', auth, (req, res) => {
+app.get('/api/ig/connect', auth, h(async (req, res) => {
   if (!e.META_APP_ID) return res.redirect('/?error=' + encodeURIComponent('Meta app is not configured'));
   const s = crypto.randomBytes(16).toString('hex');
-  res.cookie('ig_state', s, { httpOnly: true, sameSite: 'lax', secure: prod, maxAge: 600e3 }).redirect(IG.authUrl(s));
-});
+  await q('delete from instagram_oauth_states where expires_at <= now()');
+  await q('insert into instagram_oauth_states(state_hash,user_id,expires_at) values($1,$2,now()+interval \'10 minutes\')', [sha(s), req.user.id]);
+  res.redirect(IG.authUrl(s));
+}));
 app.get('/api/ig/callback', auth, h(async (req, res) => {
   const fail = m => res.redirect('/?error=' + encodeURIComponent(m));
-  if (!req.query.state || req.query.state !== req.cookies.ig_state) return fail('Invalid OAuth state');
-  res.clearCookie('ig_state');
+  if (typeof req.query.state !== 'string' || !/^[a-f0-9]{32}$/.test(req.query.state)) return fail('Invalid OAuth state');
+  const consumedState = await q('delete from instagram_oauth_states where state_hash=$1 and user_id=$2 and expires_at>now() returning state_hash', [sha(req.query.state), req.user.id]);
+  if (!consumedState.length) return fail('Invalid OAuth state');
   if (!req.query.code) return fail(req.query.error_description || 'Instagram authorization was cancelled');
   try {
     const a = await IG.connect(String(req.query.code)), plan = await effectivePlanOf(req.user);
