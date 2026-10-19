@@ -154,21 +154,30 @@ app.get('/api/ig/connect', auth, h(async (req, res) => {
   await q('insert into instagram_oauth_states(state_hash,user_id,expires_at) values($1,$2,now()+interval \'10 minutes\')', [sha(s), req.user.id]);
   res.redirect(IG.authUrl(s));
 }));
-app.get('/api/ig/callback', auth, h(async (req, res) => {
+app.get('/api/ig/callback', h(async (req, res) => {
   const fail = m => res.redirect('/?error=' + encodeURIComponent(m));
   if (typeof req.query.state !== 'string' || !/^[a-f0-9]{32}$/.test(req.query.state)) return fail('Invalid OAuth state');
-  const consumedState = await q('delete from instagram_oauth_states where state_hash=$1 and user_id=$2 and expires_at>now() returning state_hash', [sha(req.query.state), req.user.id]);
-  if (!consumedState.length) return fail('Invalid OAuth state');
-  if (!req.query.code) return fail(req.query.error_description || 'Instagram authorization was cancelled');
+  const [consumedState] = await q('delete from instagram_oauth_states where state_hash=$1 and expires_at>now() returning user_id', [sha(req.query.state)]);
+  if (!consumedState) return fail('Invalid OAuth state');
+  if (req.query.error) {
+    console.warn('Instagram OAuth authorization was denied:', String(req.query.error).slice(0, 100));
+    return fail('Instagram authorization was cancelled or denied.');
+  }
+  if (typeof req.query.code !== 'string' || !req.query.code) return fail('Instagram did not return an authorization code.');
   try {
-    const a = await IG.connect(String(req.query.code)), plan = await effectivePlanOf(req.user);
-    const [ex] = await q('select 1 from ig_accounts where user_id=$1 and ig_user_id=$2', [req.user.id, a.id]);
-    const [{ n }] = await q("select count(*)::int n from ig_accounts where user_id=$1 and status<>'DISCONNECTED'", [req.user.id]);
+    const [user] = await q('select * from users where id=$1 and active=true', [consumedState.user_id]);
+    if (!user) return fail('Your account is unavailable. Please log in and try again.');
+    const a = await IG.connect(req.query.code), plan = await effectivePlanOf(user);
+    const [ex] = await q('select 1 from ig_accounts where user_id=$1 and ig_user_id=$2', [user.id, a.id]);
+    const [{ n }] = await q("select count(*)::int n from ig_accounts where user_id=$1 and status<>'DISCONNECTED'", [user.id]);
     if (!ex && n >= plan.max_accounts) return fail(`Your plan allows ${plan.max_accounts} connected account(s)`);
     await q(`insert into ig_accounts(user_id,ig_user_id,username,picture,token_enc,token_expires) values($1,$2,$3,$4,$5,$6)
-      on conflict(user_id,ig_user_id) do update set username=$3,picture=$4,token_enc=$5,token_expires=$6,status='CONNECTED',last_error=null`, [req.user.id, a.id, a.username, a.picture, enc(a.token), a.expires]);
+      on conflict(user_id,ig_user_id) do update set username=$3,picture=$4,token_enc=$5,token_expires=$6,status='CONNECTED',last_error=null`, [user.id, a.id, a.username, a.picture, enc(a.token), a.expires]);
     res.redirect('/?connected=1');
-  } catch (x) { fail(x.message); }
+  } catch (x) {
+    console.error('Instagram OAuth callback failed:', x.message);
+    fail('Could not complete Instagram authorization. Please try again.');
+  }
 }));
 app.post('/api/accounts/:id/enabled', auth, h(async (req, res) => { const r = await q('update ig_accounts set enabled=$3 where id=$1 and user_id=$2 returning id', [req.params.id, req.user.id, !!req.body.enabled]); r.length ? res.json({ ok: true }) : bad(res, 'Not found', 404); }));
 app.delete('/api/accounts/:id', auth, h(async (req, res) => { // disconnect: drop token, cancel pending jobs, keep history
