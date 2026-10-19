@@ -38,6 +38,27 @@ export const storage = {
 };
 
 const V = e.META_GRAPH_API_VERSION || 'v21.0', GH = 'https://graph.instagram.com';
+const redactMetaError = message => String(message)
+  .replace(/(access_token|client_secret|code)=([^&\s"]+)/gi, '$1=[redacted]')
+  .replace(/\b(IG|EA)[A-Za-z0-9]{40,}\b/g, '[redacted]')
+  .replace(e.META_APP_SECRET ? new RegExp(e.META_APP_SECRET.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'g') : /$^/, '[redacted]');
+async function oauthRequest(url, options, stage) {
+  let response;
+  try { response = await fetch(url, options); }
+  catch (error) {
+    const failure = new Error(`Network error during ${stage}: ${redactMetaError(error.message)}`);
+    failure.stage = stage;
+    throw failure;
+  }
+  const data = await response.json().catch(() => ({}));
+  if (!response.ok || data.error || data.error_message) {
+    const failure = new Error(redactMetaError(data.error?.message || data.error_message || `Instagram API error ${response.status}`));
+    failure.stage = stage;
+    failure.metaCode = data.error?.code;
+    throw failure;
+  }
+  return data;
+}
 async function j(r) {
   const d = await r.json().catch(() => ({}));
   if (!r.ok || d.error || d.error_message) {
@@ -50,10 +71,38 @@ async function j(r) {
 export const IG = {
   authUrl: s => 'https://www.instagram.com/oauth/authorize?' + new URLSearchParams({ client_id: e.META_APP_ID, redirect_uri: e.META_REDIRECT_URI, response_type: 'code', scope: e.META_SCOPES || 'instagram_business_basic,instagram_business_content_publish', state: s }),
   async connect(code) {
-    const s = await j(await fetch('https://api.instagram.com/oauth/access_token', { method: 'POST', body: new URLSearchParams({ client_id: e.META_APP_ID, client_secret: e.META_APP_SECRET, grant_type: 'authorization_code', redirect_uri: e.META_REDIRECT_URI, code: code.replace(/#_$/, '') }) }));
-    const l = await j(await fetch(`${GH}/access_token?` + new URLSearchParams({ grant_type: 'ig_exchange_token', client_secret: e.META_APP_SECRET, access_token: s.access_token })));
-    const me = await j(await fetch(`${GH}/${V}/me?` + new URLSearchParams({ fields: 'user_id,username,profile_picture_url', access_token: l.access_token })));
-    return { token: l.access_token, expires: new Date(Date.now() + l.expires_in * 1000), id: String(me.user_id || s.user_id), username: me.username, picture: me.profile_picture_url };
+    const firstResponse = await oauthRequest('https://api.instagram.com/oauth/access_token', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+      body: new URLSearchParams({ client_id: e.META_APP_ID, client_secret: e.META_APP_SECRET, grant_type: 'authorization_code', redirect_uri: e.META_REDIRECT_URI, code: code.replace(/#_$/, '') })
+    }, 'token_exchange');
+    const first = Array.isArray(firstResponse.data) ? firstResponse.data[0] : firstResponse;
+    if (!first?.access_token) {
+      const error = new Error('Instagram did not return an access token.');
+      error.stage = 'token_exchange';
+      throw error;
+    }
+
+    let token = first.access_token;
+    let expiresIn = first.expires_in;
+    try {
+      const longLived = await oauthRequest(`${GH}/access_token?` + new URLSearchParams({ grant_type: 'ig_exchange_token', client_secret: e.META_APP_SECRET, access_token: token }), {}, 'long_lived_exchange');
+      if (longLived.access_token) {
+        token = longLived.access_token;
+        expiresIn = longLived.expires_in ?? expiresIn;
+      }
+    } catch (error) {
+      console.warn(`Instagram long-lived token exchange failed (${error.stage}): ${error.message}. Continuing with the short-lived token.`);
+    }
+
+    const me = await oauthRequest(`${GH}/${V}/me?` + new URLSearchParams({ fields: 'user_id,username,profile_picture_url', access_token: token }), {}, 'account_lookup');
+    const id = me.user_id || first.user_id;
+    if (!id) {
+      const error = new Error('Instagram account lookup did not return a user ID.');
+      error.stage = 'account_lookup';
+      throw error;
+    }
+    return { token, expires: expiresIn ? new Date(Date.now() + expiresIn * 1000) : null, id: String(id), username: me.username, picture: me.profile_picture_url };
   },
   post: async (p, tok, body) => j(await fetch(`${GH}/${V}/${p}`, { method: 'POST', body: new URLSearchParams({ ...body, access_token: tok }) })),
   get: async (p, tok, qs) => j(await fetch(`${GH}/${V}/${p}?` + new URLSearchParams({ ...qs, access_token: tok })))

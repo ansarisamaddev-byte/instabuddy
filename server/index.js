@@ -175,7 +175,7 @@ app.get('/api/ig/callback', h(async (req, res) => {
       on conflict(user_id,ig_user_id) do update set username=$3,picture=$4,token_enc=$5,token_expires=$6,status='CONNECTED',last_error=null`, [user.id, a.id, a.username, a.picture, enc(a.token), a.expires]);
     res.redirect('/?connected=1');
   } catch (x) {
-    console.error('Instagram OAuth callback failed:', x.message);
+    console.error(`Instagram OAuth callback failed (${x.stage || 'callback'}):`, x.message);
     fail('Could not complete Instagram authorization. Please try again.');
   }
 }));

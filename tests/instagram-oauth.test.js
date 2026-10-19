@@ -1,0 +1,69 @@
+import test from 'node:test';
+import assert from 'node:assert/strict';
+
+process.env.META_APP_ID = 'test-app-id';
+process.env.META_APP_SECRET = 'test-app-secret';
+process.env.META_REDIRECT_URI = 'https://example.com/api/ig/callback';
+
+const { IG } = await import('../server/lib.js');
+const jsonResponse = (body, status = 200) => ({
+  ok: status >= 200 && status < 300,
+  status,
+  json: async () => body
+});
+
+test('Instagram Login uses configured callback and resolves a long-lived token', async () => {
+  const originalFetch = globalThis.fetch;
+  const requests = [];
+  globalThis.fetch = async (url, options) => {
+    requests.push({ url: String(url), options });
+    if (requests.length === 1) return jsonResponse({ data: [{ access_token: 'short-token', expires_in: 3600, user_id: '123' }] });
+    if (requests.length === 2) return jsonResponse({ access_token: 'long-token', expires_in: 5184000 });
+    return jsonResponse({ user_id: '123', username: 'creator', profile_picture_url: 'https://example.com/profile.jpg' });
+  };
+
+  try {
+    const authorization = new URL(IG.authUrl('state-value'));
+    assert.equal(authorization.origin, 'https://www.instagram.com');
+    assert.equal(authorization.searchParams.get('redirect_uri'), 'https://example.com/api/ig/callback');
+    assert.equal(authorization.searchParams.get('client_id'), 'test-app-id');
+
+    const account = await IG.connect('authorization-code#_');
+    assert.equal(account.token, 'long-token');
+    assert.equal(account.id, '123');
+    assert.equal(account.username, 'creator');
+    assert.equal(account.picture, 'https://example.com/profile.jpg');
+    assert.ok(account.expires instanceof Date);
+
+    const tokenRequest = new URLSearchParams(requests[0].options.body);
+    assert.equal(tokenRequest.get('redirect_uri'), 'https://example.com/api/ig/callback');
+    assert.equal(tokenRequest.get('code'), 'authorization-code');
+    assert.equal(new URL(requests[1].url).origin, 'https://graph.instagram.com');
+    assert.equal(new URL(requests[2].url).origin, 'https://graph.instagram.com');
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test('Instagram Login can continue with a short-lived token if exchange fails', async () => {
+  const originalFetch = globalThis.fetch;
+  const originalWarn = console.warn;
+  let requestCount = 0;
+  globalThis.fetch = async () => {
+    requestCount += 1;
+    if (requestCount === 1) return jsonResponse({ access_token: 'short-token', expires_in: 3600, user_id: '456' });
+    if (requestCount === 2) return jsonResponse({ error: { message: 'Temporary failure' } }, 400);
+    return jsonResponse({ user_id: '456', username: 'creator' });
+  };
+  console.warn = () => {};
+
+  try {
+    const account = await IG.connect('authorization-code');
+    assert.equal(account.token, 'short-token');
+    assert.equal(account.id, '456');
+    assert.equal(requestCount, 3);
+  } finally {
+    globalThis.fetch = originalFetch;
+    console.warn = originalWarn;
+  }
+});
